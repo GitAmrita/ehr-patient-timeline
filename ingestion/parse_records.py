@@ -8,10 +8,11 @@ File classification uses keyword matching on filenames since names vary per pati
 Content parsing handles markdown format: **Key:** Value fields and | table | rows.
 
 Output (raw/parsed/):
-    patients.parquet    — demographics, one row per patient (from patient_summary files)
-    encounters.parquet  — ED visits, discharges, ICU admissions (one row per document)
-    labs.parquet        — individual lab test results (one row per test)
-    notes.parquet       — clinical notes, consults, imaging reports (one row per document)
+    demographics_raw.parquet — demographic fields extracted from every file
+                               (one row per source file, deduplicated in dbt)
+    encounters.parquet       — ED visits, discharges, ICU admissions (one row per document)
+    labs.parquet             — individual lab test results (one row per test)
+    notes.parquet            — clinical notes, consults, imaging reports (one row per document)
 
 Usage:
     python ingestion/parse_records.py
@@ -65,8 +66,12 @@ def classify_file(filename: str) -> str:
 # Field extraction helpers
 # ---------------------------------------------------------------------------
 
-# Matches **Key:** Value or **Key:** Value (bold markdown fields)
+# Matches **Key:** Value (markdown bold fields)
 BOLD_FIELD = re.compile(r"\*\*([^*]+?)\*\*[:\s]+(.+)")
+
+# Matches plain text fixed-width fields: "Patient ID:       PC-092-2024"
+# Requires 2+ spaces after colon to avoid matching mid-sentence colons
+PLAIN_FIELD = re.compile(r"^([A-Za-z][A-Za-z\s/()]+):\s{2,}(.+)")
 
 # Matches markdown table rows: | cell | cell | ...
 TABLE_ROW = re.compile(r"^\|(.+)\|$")
@@ -79,11 +84,18 @@ DATE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Age/gender inferred from narrative: "76-year-old female"
+AGE_GENDER_PATTERN = re.compile(
+    r"(\d{1,3})[\s-]year[\s-]old\s+(male|female|man|woman)",
+    re.IGNORECASE,
+)
+
 
 def extract_bold_field(text: str, *keys: str) -> str | None:
-    """Extract the first matching **Key:** value for any of the given keys."""
+    """Extract the first matching field value for any of the given keys.
+    Handles both markdown bold (**Key:**) and plain text (Key:   value) formats."""
     for line in text.splitlines():
-        m = BOLD_FIELD.search(line)
+        m = BOLD_FIELD.search(line) or PLAIN_FIELD.match(line.strip())
         if m:
             field_name = m.group(1).strip().lower()
             for key in keys:
@@ -107,13 +119,71 @@ def extract_patient_id(text: str) -> str | None:
 def extract_patient_name(text: str) -> str | None:
     """Extract patient name — matches 'Name:' or 'Patient:' but not 'Patient ID:'."""
     for line in text.splitlines():
-        m = BOLD_FIELD.search(line)
+        m = BOLD_FIELD.search(line) or PLAIN_FIELD.match(line.strip())
         if m:
             field = m.group(1).strip().lower().rstrip(":")
-            # 'name' alone, or 'patient' alone (not 'patient id' / 'patient mrn')
-            if field == "name" or field == "patient":
+            if field in ("name", "patient", "patient name"):
                 return m.group(2).strip()
     return None
+
+
+# ---------------------------------------------------------------------------
+# Demographic extraction — runs on every file type
+# ---------------------------------------------------------------------------
+
+def extract_demographics(folder_id: str, source_file: str, text: str) -> dict:
+    """
+    Extract demographic fields from any EHR file.
+    - Explicit fields come from **Key:** Value bold markdown patterns.
+    - Age/gender may be inferred from narrative ("76-year-old female") when
+      not explicitly present. Inferred values are flagged so dbt can deprioritize them.
+    """
+    explicit: dict[str, str | None] = {
+        "patient_id":   None,
+        "patient_name": None,
+        "age":          None,
+        "gender":       None,
+        "dob":          None,
+    }
+
+    for line in text.splitlines():
+        m = BOLD_FIELD.search(line) or PLAIN_FIELD.match(line.strip())
+        if not m:
+            continue
+        field = m.group(1).strip().lower().rstrip(":")
+        val = m.group(2).strip()
+
+        if field in ("patient", "name", "patient name") and not explicit["patient_name"]:
+            explicit["patient_name"] = val
+        elif ("mrn" in field or field in ("patient id", "patient #") or "medical record" in field) and not explicit["patient_id"]:
+            explicit["patient_id"] = val
+        elif field in ("age", "date of birth") and "date of birth" not in field and not explicit["age"]:
+            explicit["age"] = val
+        elif field in ("gender", "sex") and not explicit["gender"]:
+            explicit["gender"] = val
+        elif ("dob" in field or "date of birth" in field) and not explicit["dob"]:
+            explicit["dob"] = val
+
+    # Infer age/gender from narrative only when not found explicitly
+    age_inferred = gender_inferred = False
+    if not explicit["age"] or not explicit["gender"]:
+        m2 = AGE_GENDER_PATTERN.search(text)
+        if m2:
+            if not explicit["age"]:
+                explicit["age"] = m2.group(1)
+                age_inferred = True
+            if not explicit["gender"]:
+                raw_gender = m2.group(2).lower()
+                explicit["gender"] = "female" if raw_gender in ("female", "woman") else "male"
+                gender_inferred = True
+
+    return {
+        "folder_id":      folder_id,
+        "source_file":    source_file,
+        **explicit,
+        "age_inferred":     age_inferred,
+        "gender_inferred":  gender_inferred,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -263,8 +333,7 @@ def run(samples_dir: Path = SAMPLES_DIR, parsed_dir: Path = PARSED_DIR) -> None:
     patient_folders = sorted(p for p in samples_dir.iterdir() if p.is_dir())
     log.info("Processing %d patient folders...", len(patient_folders))
 
-    summaries, encounters, all_labs, notes = [], [], [], []
-    skipped = 0
+    all_demographics, encounters, all_labs, notes = [], [], [], []
 
     for folder in patient_folders:
         folder_id = folder.name
@@ -275,53 +344,54 @@ def run(samples_dir: Path = SAMPLES_DIR, parsed_dir: Path = PARSED_DIR) -> None:
             text = f.read_text(encoding="utf-8", errors="replace")
             entity = classify_file(f.name)
 
+            # Extract demographics from every file regardless of entity type
+            all_demographics.append(extract_demographics(folder_id, f.name, text))
+
             if entity == "summary":
-                summaries.append(parse_summary(folder_id, text))
+                pass  # demographics captured above; no separate summary table needed
 
             elif entity == "encounter":
                 encounters.append(parse_encounter(folder_id, text, f.stem))
 
             elif entity == "labs":
-                lab_rows = parse_labs(folder_id, text)
-                all_labs.extend(lab_rows)
+                all_labs.extend(parse_labs(folder_id, text))
 
             elif entity in ("imaging", "ecg", "cardiology", "consult", "other"):
                 notes.append(parse_note(folder_id, text, f.stem))
 
-            else:
-                skipped += 1
-
-    # Write Parquet files
     results = {
-        "patients":   pd.DataFrame(summaries),
-        "encounters": pd.DataFrame(encounters),
-        "labs":       pd.DataFrame(all_labs),
-        "notes":      pd.DataFrame(notes),
+        "demographics_raw": pd.DataFrame(all_demographics),
+        "encounters":        pd.DataFrame(encounters),
+        "labs":              pd.DataFrame(all_labs),
+        "notes":             pd.DataFrame(notes),
     }
 
     for name, df in results.items():
         out = parsed_dir / f"{name}.parquet"
         df.to_parquet(out, index=False)
-        log.info("Wrote %-15s — %4d rows → %s", name, len(df), out)
+        log.info("Wrote %-20s — %4d rows → %s", name, len(df), out)
 
-    if skipped:
-        log.warning("Skipped %d files with unhandled entity type", skipped)
+    # Sanity check: how many unique patients have each demographic field
+    demo_df = results["demographics_raw"]
+    has_name    = demo_df.groupby("folder_id")["patient_name"].any().sum()
+    has_id      = demo_df.groupby("folder_id")["patient_id"].any().sum()
+    has_age     = demo_df.groupby("folder_id")["age"].any().sum()
+    has_gender  = demo_df.groupby("folder_id")["gender"].any().sum()
+    has_dob     = demo_df.groupby("folder_id")["dob"].any().sum()
+    n_patients  = demo_df["folder_id"].nunique()
 
-    # Sanity check
-    if not summaries:
-        log.warning("No patient_summary files found — patients.parquet will be empty")
-        return
+    print(f"\nDemographic coverage across {n_patients} patients:")
+    print(f"  patient_id   : {has_id}/{n_patients}")
+    print(f"  patient_name : {has_name}/{n_patients}")
+    print(f"  age          : {has_age}/{n_patients}")
+    print(f"  gender       : {has_gender}/{n_patients}")
+    print(f"  dob          : {has_dob}/{n_patients}")
 
-    sample = results["patients"][["folder_id", "patient_id", "patient_name", "age", "gender"]].head(5)
-    print("\nSample patients:")
+    sample = demo_df[demo_df["patient_name"].notna()][
+        ["folder_id", "source_file", "patient_id", "patient_name", "age", "gender", "dob", "age_inferred"]
+    ].head(5)
+    print("\nSample demographics_raw rows:")
     print(sample.to_string(index=False))
-
-    if not all_labs:
-        log.warning("No lab rows extracted — check lab file parsing")
-    else:
-        sample_labs = results["labs"][["folder_id", "patient_id", "test_name", "result", "status"]].head(5)
-        print("\nSample labs:")
-        print(sample_labs.to_string(index=False))
 
 
 if __name__ == "__main__":
