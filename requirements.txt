@@ -1,0 +1,24 @@
+# data pipeline
+dbt-duckdb>=1.8.0
+duckdb>=0.10.0
+pandas>=2.0.0
+pyarrow>=14.0.0
+
+# huggingface dataset download
+datasets>=2.18.0
+
+# api
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.0.0
+
+# fhir serialization
+fhir.resources>=7.1.0
+
+# nlp (install separately after core deps — see README)
+# pip install scispacy==0.5.4
+# pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_ner_bc5cdr_md-0.5.4.tar.gz
+
+# dev
+httpx>=0.27.0
+pytest>=8.0.0
