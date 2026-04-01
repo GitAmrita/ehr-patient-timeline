@@ -1,25 +1,17 @@
 """
 parse_records.py
 
-Parses raw EHR text rows into structured Parquet files per entity type.
+Walks raw/patient-samples/ and parses each patient's files into
+entity-specific Parquet files under raw/parsed/.
 
-Dataset structure (per patient record, separated by '===' lines):
-  [title chunk]    — single line, document type (only at dataset start)
-  [content chunk]  — starts with 'PATIENT INFORMATION', the actual clinical data
-  [footer chunk]   — starts with 'END OF REPORT', contains JSON with folder/file metadata
-
-Sections present in content chunks:
-  PATIENT INFORMATION, BASELINE VITALS, EXERCISE DATA,
-  SYMPTOMS DURING TEST, ECG FINDINGS, INTERPRETATION,
-  STRESS ECHOCARDIOGRAPHY FINDINGS, PERFUSION IMAGING, RECOMMENDATIONS
+File classification uses keyword matching on filenames since names vary per patient.
+Content parsing handles markdown format: **Key:** Value fields and | table | rows.
 
 Output (raw/parsed/):
-  patients.parquet        — one row per report (demographics + metadata)
-  vitals.parquet          — baseline vitals per report
-  exercise.parquet        — exercise test metrics per report
-  ecg_findings.parquet    — ECG findings per report
-  interpretations.parquet — interpretation / clinical conclusion per report
-  symptoms.parquet        — symptom flags per report
+    patients.parquet    — demographics, one row per patient (from patient_summary files)
+    encounters.parquet  — ED visits, discharges, ICU admissions (one row per document)
+    labs.parquet        — individual lab test results (one row per test)
+    notes.parquet       — clinical notes, consults, imaging reports (one row per document)
 
 Usage:
     python ingestion/parse_records.py
@@ -27,245 +19,309 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-import uuid
 from pathlib import Path
 
 import pandas as pd
-import pyarrow.parquet as pq
 
-RAW_FILE = Path(__file__).parent.parent / "raw" / "ehr_raw.parquet"
+SAMPLES_DIR = Path(__file__).parent.parent / "raw" / "patient-samples"
 PARSED_DIR = Path(__file__).parent.parent / "raw" / "parsed"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-DOC_SEP = re.compile(r"^={10,}$")
-SEC_SEP = re.compile(r"^-{10,}$")
+# ---------------------------------------------------------------------------
+# File classification — keyword sets per entity type
+# ---------------------------------------------------------------------------
+
+ENTITY_KEYWORDS: dict[str, list[str]] = {
+    "summary":   ["patient_summary", "patient_profile"],
+    "labs":      ["lab_result", "lab_report", "sepsis_lab", "cardiac_lab",
+                  "chemistry_panel", "metabolic_panel", "comprehensive_lab",
+                  "comprehensive_metabolic", "urinalysis", "blood_panel"],
+    "imaging":   ["chest_xray", "chest_x_ray", "echocardiogram", "echo_report",
+                  "renal_ultrasound", "imaging", "radiology", "xray"],
+    "ecg":       ["ecg_report", "ecg", "ekg"],
+    "cardiology":["cardiology_consult", "cardiac_cath", "cardiology_eval"],
+    "encounter": ["ed_note", "ed_notes", "ed_clinical_note", "ed_admission",
+                  "ed_triage", "discharge_summary", "discharge_instruction",
+                  "icu_admission", "admission_note", "instructions"],
+    "consult":   ["consult", "report", "ophthalmology", "nephrology",
+                  "nutrition", "surgical", "endo", "endocrine", "endocrinology"],
+}
+
+
+def classify_file(filename: str) -> str:
+    """Return entity type for a given filename based on keyword matching."""
+    stem = Path(filename).stem.lower()
+    for entity, keywords in ENTITY_KEYWORDS.items():
+        if any(kw in stem for kw in keywords):
+            return entity
+    return "other"
 
 
 # ---------------------------------------------------------------------------
-# Step 1: split raw rows into chunks at '===' separators
+# Field extraction helpers
 # ---------------------------------------------------------------------------
 
-def split_chunks(rows: list[str]) -> list[list[str]]:
-    chunks, cur = [], []
-    for row in rows:
-        if DOC_SEP.match(row.strip()):
-            if cur:
-                chunks.append(cur)
-                cur = []
-        else:
-            cur.append(row)
-    if cur:
-        chunks.append(cur)
-    return [c for c in chunks if any(l.strip() for l in c)]
+# Matches **Key:** Value or **Key:** Value (bold markdown fields)
+BOLD_FIELD = re.compile(r"\*\*([^*]+?)\*\*[:\s]+(.+)")
+
+# Matches markdown table rows: | cell | cell | ...
+TABLE_ROW = re.compile(r"^\|(.+)\|$")
+
+# Date patterns
+DATE_PATTERN = re.compile(
+    r"(January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+\d{1,2},?\s+\d{4}"
+    r"|\d{4}-\d{2}-\d{2}",
+    re.IGNORECASE,
+)
 
 
-# ---------------------------------------------------------------------------
-# Step 2: pair content + footer chunks into records
-# ---------------------------------------------------------------------------
-
-def pair_into_records(chunks: list[list[str]]) -> list[dict]:
-    """
-    Chunks come in groups: (optional title) | content | footer | content | footer ...
-    Content chunks start with 'PATIENT INFORMATION'.
-    Footer chunks start with 'END OF REPORT' and contain JSON metadata.
-    """
-    records = []
-    i = 0
-    while i < len(chunks):
-        non_empty = [l.strip() for l in chunks[i] if l.strip()]
-        if not non_empty:
-            i += 1
-            continue
-
-        first = non_empty[0]
-
-        if first == "PATIENT INFORMATION":
-            content = chunks[i]
-            footer = chunks[i + 1] if i + 1 < len(chunks) else []
-            records.append({"content": content, "footer": footer})
-            i += 2  # consume both
-        else:
-            i += 1  # skip title or unrecognised chunk
-
-    return records
-
-
-# ---------------------------------------------------------------------------
-# Step 3: parse sections within a content chunk
-# ---------------------------------------------------------------------------
-
-def parse_sections(lines: list[str]) -> dict[str, list[str]]:
-    sections: dict[str, list[str]] = {}
-    current = "_preamble"
-    sections[current] = []
-
-    for line in lines:
-        s = line.strip()
-        if (
-            s
-            and s == s.upper()
-            and len(s) > 3
-            and not DOC_SEP.match(s)
-            and not SEC_SEP.match(s)
-            and ":" not in s
-        ):
-            current = s
-            sections.setdefault(current, [])
-        else:
-            sections.setdefault(current, []).append(s)
-
-    return sections
-
-
-def extract_field(lines: list[str], key: str) -> str | None:
-    pattern = re.compile(rf"^{re.escape(key)}\s*:\s*(.+)$", re.IGNORECASE)
-    for line in lines:
-        m = pattern.match(line.strip())
+def extract_bold_field(text: str, *keys: str) -> str | None:
+    """Extract the first matching **Key:** value for any of the given keys."""
+    for line in text.splitlines():
+        m = BOLD_FIELD.search(line)
         if m:
-            return m.group(1).strip()
+            field_name = m.group(1).strip().lower()
+            for key in keys:
+                if key.lower() in field_name:
+                    return m.group(2).strip()
     return None
 
 
-def extract_footer_meta(footer_lines: list[str]) -> dict:
-    """Extract folder ID and file type from the JSON block in the footer."""
-    text = " ".join(l.strip() for l in footer_lines)
-    meta = {"folder_id": None, "file_type": None}
-    try:
-        json_match = re.search(r"\{.*\}", text)
-        if json_match:
-            data = json.loads(json_match.group())
-            meta["folder_id"] = data.get("folder")
-            meta["file_type"] = data.get("file")
-    except (json.JSONDecodeError, AttributeError):
-        pass
-    return meta
+def extract_date(text: str) -> str | None:
+    """Extract the first date-like string from the text."""
+    m = DATE_PATTERN.search(text)
+    return m.group(0).strip() if m else None
+
+
+def extract_patient_id(text: str) -> str | None:
+    """Extract patient MRN / Patient ID from markdown text.
+    Matches specific ID fields only — not plain 'Patient:' which holds the name."""
+    return extract_bold_field(text, "mrn", "patient id", "medical record number", "medical record")
+
+
+def extract_patient_name(text: str) -> str | None:
+    """Extract patient name — matches 'Name:' or 'Patient:' but not 'Patient ID:'."""
+    for line in text.splitlines():
+        m = BOLD_FIELD.search(line)
+        if m:
+            field = m.group(1).strip().lower().rstrip(":")
+            # 'name' alone, or 'patient' alone (not 'patient id' / 'patient mrn')
+            if field == "name" or field == "patient":
+                return m.group(2).strip()
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Step 4: extract entity rows from a parsed record
+# Lab table parser
 # ---------------------------------------------------------------------------
 
-def extract_record(record: dict) -> dict:
-    doc_id = str(uuid.uuid4())
-    sections = parse_sections(record["content"])
-    meta = extract_footer_meta(record["footer"])
+def parse_lab_tables(text: str) -> list[dict]:
+    """
+    Parse markdown tables into individual lab test rows.
+    Expects tables with a 'Parameter' column and a 'Result' column.
+    Returns list of dicts with keys: test_name, result, reference_range, status.
+    """
+    rows = []
+    lines = text.splitlines()
+    header: list[str] | None = None
 
-    pi = sections.get("PATIENT INFORMATION", [])
-    vitals = sections.get("BASELINE VITALS", sections.get("BASELINE DATA", []))
-    exercise = sections.get("EXERCISE DATA", sections.get("STRESS DATA", sections.get("PHYSIOLOGIC DATA", [])))
-    ecg = sections.get(
-        "ECG FINDINGS",
-        sections.get("ELECTROCARDIOGRAPHIC FINDINGS", sections.get("ECG ANALYSIS", [])),
-    )
-    interp = sections.get(
-        "INTERPRETATION",
-        sections.get("IMPRESSION", sections.get("IMPRESSION / DIAGNOSIS", [])),
-    )
-    symptoms = sections.get("SYMPTOMS DURING TEST", sections.get("SYMPTOMS", []))
+    for line in lines:
+        m = TABLE_ROW.match(line.strip())
+        if not m:
+            header = None
+            continue
 
-    patient_id = extract_field(pi, "Patient ID")
-    study_date = extract_field(pi, "Study Date")
+        cells = [c.strip() for c in m.group(1).split("|")]
 
+        # Detect header row
+        if any(c.lower() in ("parameter", "test", "analyte") for c in cells):
+            header = [c.lower() for c in cells]
+            continue
+
+        # Skip separator rows (---|---|---)
+        if all(re.match(r"^-+$", c) or c == "" for c in cells):
+            continue
+
+        if header is None or len(cells) < 2:
+            continue
+
+        def get_col(names: list[str]) -> str:
+            for name in names:
+                for i, h in enumerate(header):
+                    if name in h and i < len(cells):
+                        return re.sub(r"\*+", "", cells[i]).strip()
+            return ""
+
+        test_name = get_col(["parameter", "test", "analyte"])
+        result = get_col(["result", "value"])
+        ref_range = get_col(["reference", "range", "normal"])
+        status = get_col(["status", "flag", "interpretation"])
+
+        if test_name and result:
+            rows.append({
+                "test_name": test_name,
+                "result": result,
+                "reference_range": ref_range or None,
+                "status": status or None,
+            })
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Per-entity parsers
+# ---------------------------------------------------------------------------
+
+def parse_summary(folder_id: str, text: str) -> dict:
     return {
-        "doc_id": doc_id,
-        "folder_id": meta["folder_id"],
-        "file_type": meta["file_type"],
-        "patient_id": patient_id,
-        "patient_name": extract_field(pi, "Patient Name"),
-        "study_date": study_date,
-        "study_type": extract_field(pi, "Study Type"),
-        "protocol": extract_field(pi, "Protocol"),
-        # vitals
-        "heart_rate_bpm": extract_field(vitals, "Heart Rate"),
-        "blood_pressure": extract_field(vitals, "Blood Pressure"),
-        "o2_saturation": extract_field(vitals, "Oxygen Saturation"),
-        # exercise
-        "exercise_time": extract_field(exercise, "Total Exercise Time"),
-        "max_hr_achieved": extract_field(exercise, "Max Heart Rate Achieved"),
-        "target_hr": extract_field(exercise, "Target Heart Rate"),
-        "mets_achieved": extract_field(exercise, "METs Achieved"),
-        "reason_stopped": extract_field(exercise, "Reason for Stopping"),
-        # ecg
-        "ecg_baseline": extract_field(ecg, "Baseline"),
-        "ecg_during_exercise": extract_field(ecg, "During Exercise"),
-        "ecg_st_changes": extract_field(ecg, "ST Changes"),
-        "ecg_arrhythmias": extract_field(ecg, "Arrhythmias"),
-        # interpretation
-        "test_result": extract_field(interp, "Test Result"),
-        "functional_capacity": extract_field(interp, "Functional Capacity"),
-        "interpretation_text": " ".join(l for l in interp if l),
-        # symptoms (flagged as present/not present)
-        "chest_pain": extract_field(symptoms, "Chest Pain"),
-        "shortness_of_breath": extract_field(symptoms, "Shortness of Breath"),
-        "dizziness": extract_field(symptoms, "Dizziness"),
+        "folder_id": folder_id,
+        "patient_id": extract_patient_id(text),
+        "patient_name": extract_patient_name(text),
+        "age": extract_bold_field(text, "age"),
+        "gender": extract_bold_field(text, "gender", "sex"),
+        "dob": extract_bold_field(text, "dob", "date of birth"),
+        "address": extract_bold_field(text, "address"),
+        "insurance": extract_bold_field(text, "primary", "insurance"),
+        "allergies": extract_bold_field(text, "allerg"),
+        "presenting_complaint": _extract_section(text, "PRESENTING COMPLAINT", "CURRENT SYMPTOMS"),
+    }
+
+
+def parse_encounter(folder_id: str, text: str, file_type: str) -> dict:
+    return {
+        "folder_id": folder_id,
+        "patient_id": extract_patient_id(text),
+        "encounter_date": extract_date(text),
+        "encounter_type": file_type,
+        "attending": extract_bold_field(text, "attending", "physician", "provider"),
+        "chief_complaint": extract_bold_field(text, "chief complaint"),
+        "disposition": extract_bold_field(text, "disposition", "case status"),
+        "note_text": text[:2000],  # first 2000 chars for searchability
+    }
+
+
+def parse_labs(folder_id: str, text: str) -> list[dict]:
+    patient_id = extract_patient_id(text)
+    collection_date = extract_date(text)
+    lab_rows = parse_lab_tables(text)
+    return [
+        {
+            "folder_id": folder_id,
+            "patient_id": patient_id,
+            "collection_date": collection_date,
+            **row,
+        }
+        for row in lab_rows
+    ]
+
+
+def parse_note(folder_id: str, text: str, file_type: str) -> dict:
+    return {
+        "folder_id": folder_id,
+        "patient_id": extract_patient_id(text),
+        "note_date": extract_date(text),
+        "note_type": file_type,
+        "note_text": text[:3000],
     }
 
 
 # ---------------------------------------------------------------------------
-# Step 5: split into entity-specific DataFrames and write Parquet
+# Section extraction helper
 # ---------------------------------------------------------------------------
 
-PATIENT_COLS = ["doc_id", "folder_id", "file_type", "patient_id", "patient_name",
-                "study_date", "study_type", "protocol"]
+def _extract_section(text: str, start_heading: str, end_heading: str | None = None) -> str | None:
+    """Extract text between two markdown section headings."""
+    lines = text.splitlines()
+    capturing = False
+    captured = []
+    for line in lines:
+        clean = line.strip().lstrip("#").strip()
+        if start_heading.lower() in clean.lower():
+            capturing = True
+            continue
+        if capturing:
+            if end_heading and end_heading.lower() in clean.lower():
+                break
+            if re.match(r"^#+\s", line) and captured:
+                break
+            captured.append(line)
+    return " ".join(captured).strip() or None
 
-VITALS_COLS = ["doc_id", "patient_id", "study_date",
-               "heart_rate_bpm", "blood_pressure", "o2_saturation"]
 
-EXERCISE_COLS = ["doc_id", "patient_id", "study_date",
-                 "exercise_time", "max_hr_achieved", "target_hr",
-                 "mets_achieved", "reason_stopped"]
+# ---------------------------------------------------------------------------
+# Main runner
+# ---------------------------------------------------------------------------
 
-ECG_COLS = ["doc_id", "patient_id", "study_date",
-            "ecg_baseline", "ecg_during_exercise", "ecg_st_changes", "ecg_arrhythmias"]
-
-INTERP_COLS = ["doc_id", "patient_id", "study_date",
-               "test_result", "functional_capacity", "interpretation_text"]
-
-SYMPTOM_COLS = ["doc_id", "patient_id", "study_date",
-                "chest_pain", "shortness_of_breath", "dizziness"]
-
-
-def run(raw_file: Path = RAW_FILE, parsed_dir: Path = PARSED_DIR) -> None:
+def run(samples_dir: Path = SAMPLES_DIR, parsed_dir: Path = PARSED_DIR) -> None:
     parsed_dir.mkdir(parents=True, exist_ok=True)
 
-    log.info("Reading raw file: %s", raw_file)
-    table = pq.read_table(raw_file)
-    rows = table.to_pydict()["text"]
+    patient_folders = sorted(p for p in samples_dir.iterdir() if p.is_dir())
+    log.info("Processing %d patient folders...", len(patient_folders))
 
-    log.info("Splitting %d rows into chunks...", len(rows))
-    chunks = split_chunks(rows)
-    log.info("Found %d chunks", len(chunks))
+    summaries, encounters, all_labs, notes = [], [], [], []
+    skipped = 0
 
-    records = pair_into_records(chunks)
-    log.info("Paired into %d records", len(records))
+    for folder in patient_folders:
+        folder_id = folder.name
+        for f in sorted(folder.iterdir()):
+            if not f.is_file() or f.suffix not in (".md", ".txt") or f.name.endswith(".metadata"):
+                continue
 
-    parsed = [extract_record(r) for r in records]
-    df = pd.DataFrame(parsed)
+            text = f.read_text(encoding="utf-8", errors="replace")
+            entity = classify_file(f.name)
 
-    entities = {
-        "patients": PATIENT_COLS,
-        "vitals": VITALS_COLS,
-        "exercise": EXERCISE_COLS,
-        "ecg_findings": ECG_COLS,
-        "interpretations": INTERP_COLS,
-        "symptoms": SYMPTOM_COLS,
+            if entity == "summary":
+                summaries.append(parse_summary(folder_id, text))
+
+            elif entity == "encounter":
+                encounters.append(parse_encounter(folder_id, text, f.stem))
+
+            elif entity == "labs":
+                lab_rows = parse_labs(folder_id, text)
+                all_labs.extend(lab_rows)
+
+            elif entity in ("imaging", "ecg", "cardiology", "consult", "other"):
+                notes.append(parse_note(folder_id, text, f.stem))
+
+            else:
+                skipped += 1
+
+    # Write Parquet files
+    results = {
+        "patients":   pd.DataFrame(summaries),
+        "encounters": pd.DataFrame(encounters),
+        "labs":       pd.DataFrame(all_labs),
+        "notes":      pd.DataFrame(notes),
     }
 
-    for name, cols in entities.items():
+    for name, df in results.items():
         out = parsed_dir / f"{name}.parquet"
-        entity_df = df[cols].dropna(how="all", subset=[c for c in cols if c not in ("doc_id", "patient_id", "study_date")])
-        entity_df.to_parquet(out, index=False)
-        log.info("Wrote %-20s — %3d rows → %s", name, len(entity_df), out)
+        df.to_parquet(out, index=False)
+        log.info("Wrote %-15s — %4d rows → %s", name, len(df), out)
 
-    # Sanity check: show a sample patient record
-    sample = df[["patient_id", "folder_id", "study_date", "test_result", "mets_achieved"]].head(3)
-    print("\nSample records:")
+    if skipped:
+        log.warning("Skipped %d files with unhandled entity type", skipped)
+
+    # Sanity check
+    if not summaries:
+        log.warning("No patient_summary files found — patients.parquet will be empty")
+        return
+
+    sample = results["patients"][["folder_id", "patient_id", "patient_name", "age", "gender"]].head(5)
+    print("\nSample patients:")
     print(sample.to_string(index=False))
+
+    if not all_labs:
+        log.warning("No lab rows extracted — check lab file parsing")
+    else:
+        sample_labs = results["labs"][["folder_id", "patient_id", "test_name", "result", "status"]].head(5)
+        print("\nSample labs:")
+        print(sample_labs.to_string(index=False))
 
 
 if __name__ == "__main__":
