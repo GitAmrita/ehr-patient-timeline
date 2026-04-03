@@ -19,6 +19,10 @@ fhir.resources>=7.1.0
 # pip install scispacy==0.5.4
 # pip install https://s3-us-west-2.amazonaws.com/ai2-s2-scispacy/releases/v0.5.4/en_ner_bc5cdr_md-0.5.4.tar.gz
 
+# llm
+anthropic>=0.88.0
+python-dotenv>=1.0.0
+
 # dev
 httpx>=0.27.0
 pytest>=8.0.0
