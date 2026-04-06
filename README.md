@@ -114,8 +114,10 @@ This step is optional — the rest of the pipeline runs without it.
 
 ```bash
 python scripts/setup_db.py
-dbt run
+PROJECT_DIR=$(pwd) dbt run --project-dir dbt --profiles-dir dbt
 ```
+
+Note: `stg_nlp_entities` will error if step 3 was skipped — this is expected and does not affect the rest of the pipeline.
 
 ### 5. Start the API
 
@@ -150,3 +152,4 @@ Returns events grouped by folder, each with its own `event_count`. Supports `eve
 - **DuckDB + dbt** — serverless local warehouse with testable, documented SQL transformations
 - **Per-folder timeline grouping** — each folder is a distinct patient record; event counts are scoped accordingly
 - **Duplicate MRN handling** — the API returns all matching folders rather than arbitrarily picking one
+- **React UI** — patient search with color-coded timeline (blue = encounter, green = lab visit, orange = note); confidence badges and source citation tooltips ready for NLP entity display
