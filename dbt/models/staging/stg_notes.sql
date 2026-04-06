@@ -6,6 +6,6 @@ SELECT
     patient_id,
     note_type,
     note_text,
-    TRY_CAST(note_date AS DATE)                                 AS note_date
+    TRY_STRPTIME(note_date, '%B %d, %Y')::DATE                  AS note_date
 FROM {{ source('raw', 'notes') }}
 WHERE folder_id IS NOT NULL

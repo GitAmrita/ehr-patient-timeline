@@ -1,0 +1,26 @@
+version: 2
+
+models:
+  - name: dim_patients
+    description: One row per patient with demographics and activity counts
+    columns:
+      - name: folder_id
+        tests:
+          - not_null
+          - unique
+      - name: patient_id
+        tests:
+          - not_null
+
+  - name: patient_timeline
+    description: Unified chronological timeline of all clinical events per patient
+    columns:
+      - name: folder_id
+        tests:
+          - not_null
+      - name: event_type
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['encounter', 'lab_visit', 'note']
