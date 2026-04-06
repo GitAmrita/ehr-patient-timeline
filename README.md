@@ -4,6 +4,8 @@ A full data pipeline and REST API over synthetic multi-file EHR data, built as a
 
 **Stack:** Python · DuckDB · dbt · FastAPI · Claude AI · React
 
+![EHR Patient Timeline UI](docs/screenshot.png)
+
 ---
 
 ## Architecture
