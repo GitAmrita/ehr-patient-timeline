@@ -1,0 +1,23 @@
+version: 2
+
+sources:
+  - name: raw
+    description: >
+      Parsed EHR Parquet files registered as views in the 'raw' DuckDB schema.
+      Run scripts/setup_db.py before dbt run to register these views.
+    schema: raw
+    tables:
+      - name: demographics_raw
+        description: Demographic fields extracted from every patient file — one row per source file
+
+      - name: encounters
+        description: ED visits, discharges, ICU admissions — one row per document
+
+      - name: labs
+        description: Individual lab test results — one row per test per patient visit
+
+      - name: notes
+        description: Clinical notes, consults, imaging reports — one row per document
+
+      - name: nlp_entities
+        description: Structured entities extracted by Claude from clinical notes

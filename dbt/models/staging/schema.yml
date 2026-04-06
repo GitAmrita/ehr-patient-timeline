@@ -1,0 +1,61 @@
+version: 2
+
+models:
+  - name: stg_demographics
+    description: One row per patient with coalesced demographic fields
+    columns:
+      - name: folder_id
+        tests:
+          - not_null
+          - unique
+      - name: patient_id
+        tests:
+          - not_null
+
+  - name: stg_encounters
+    description: One row per encounter document, dates validated
+    columns:
+      - name: folder_id
+        tests:
+          - not_null
+      - name: encounter_type
+        tests:
+          - not_null
+
+  - name: stg_labs
+    description: One row per lab test result
+    columns:
+      - name: folder_id
+        tests:
+          - not_null
+      - name: test_name
+        tests:
+          - not_null
+      - name: status
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['HIGH', 'LOW', 'NORMAL', 'CRITICAL', 'CRITICAL HIGH', 'CRITICAL LOW',
+                         'ABNORMAL', 'PENDING', 'NEGATIVE', 'POSITIVE', 'BORDERLINE',
+                         'BORDERLINE HIGH', 'PRELIMINARY', 'OPTIMAL', 'LOW NORMAL',
+                         'LOW RISK', 'AVERAGE RISK', 'DESIRABLE', 'TARGET MET',
+                         'HIGH/OPTIMAL', 'ROOM AIR', 'NO GROWTH TO DATE', '-', '--']
+
+  - name: stg_notes
+    description: One row per clinical note document
+    columns:
+      - name: folder_id
+        tests:
+          - not_null
+
+  - name: stg_nlp_entities
+    description: One row per Claude-extracted entity
+    columns:
+      - name: folder_id
+        tests:
+          - not_null
+      - name: entity_type
+        tests:
+          - accepted_values:
+              arguments:
+                values: ['diagnoses', 'medications', 'procedures', 'key_findings', 'follow_up']
