@@ -97,7 +97,12 @@ def download_full(samples_dir: Path = SAMPLES_DIR) -> None:
 
 
 def inspect(samples_dir: Path = SAMPLES_DIR) -> None:
-    """Print a summary: patient count, file extensions, unique file names, sample inventories."""
+    """Print a summary: patient count, file extensions, unique file names, sample inventories.
+
+    Runs automatically after every download as a sanity check — lets you see what was
+    fetched without manually browsing the folders. Useful for spotting missing files or
+    unexpected structural variation across patients.
+    """
     patient_folders = sorted(p for p in samples_dir.iterdir() if p.is_dir())
 
     file_name_counts: dict[str, int] = defaultdict(int)

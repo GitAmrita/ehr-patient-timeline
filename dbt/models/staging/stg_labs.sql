@@ -18,14 +18,12 @@ WITH normalised AS (
         collection_date,
         TRIM(test_name)                                             AS test_name,
         TRIM(result)                                                AS result_raw,
-        TRY_CAST(REGEXP_REPLACE(TRIM(result), '[^0-9.]', '', 'g') AS DOUBLE)
-                                                                    AS result_numeric,
+        TRY_CAST(REGEXP_REPLACE(TRIM(result), '[^0-9.]', '', 'g') AS DOUBLE)  AS result_numeric,                                                         
         reference_range,
         TRY_CAST(collection_date AS DATE)                           AS collection_date_parsed,
         -- Normalise status: uninformative values → NULL, everything else → UPPERCASE
         CASE
-            WHEN UPPER(TRIM(status)) IN ('-', '--', 'NULL', 'ROOM AIR',
-                                         'NO GROWTH TO DATE', 'PRELIMINARY')
+            WHEN UPPER(TRIM(status)) IN ('-', '--', 'NULL', 'ROOM AIR','NO GROWTH TO DATE', 'PRELIMINARY')
             THEN NULL
             ELSE UPPER(TRIM(status))
         END                                                         AS status
@@ -45,5 +43,5 @@ SELECT
                         'AVERAGE RISK', 'DESIRABLE', 'TARGET MET', 'HIGH/OPTIMAL')
         THEN FALSE
         ELSE NULL  -- status is NULL (uninformative) — cannot classify
-    END                                                             AS is_abnormal
+    END AS is_abnormal
 FROM normalised

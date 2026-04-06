@@ -85,12 +85,12 @@ EXTRACTION_TOOL = {
     },
 }
 
-PROMPT_TEMPLATE = """You are a clinical NLP system. Extract structured medical entities from the following clinical document.
+SYSTEM_PROMPT = """You are a clinical NLP system. Extract structured medical entities from the following clinical document.
 
 Be precise and concise. Only extract entities explicitly mentioned in the text.
-Do not infer or add information not present in the document.
+Do not infer or add information not present in the document."""
 
-<document>
+USER_TEMPLATE = """<document>
 {note_text}
 </document>"""
 
@@ -118,10 +118,11 @@ def extract_entities(client: anthropic.Anthropic, note_text: str) -> dict:
     response = client.messages.create(
         model=MODEL,
         max_tokens=1024,
-        tools=[EXTRACTION_TOOL],
+        system=[{"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}],
+        tools=[{**EXTRACTION_TOOL, "cache_control": {"type": "ephemeral"}}],
         tool_choice={"type": "tool", "name": "extract_clinical_entities"},
         messages=[
-            {"role": "user", "content": PROMPT_TEMPLATE.format(note_text=note_text[:3000])}
+            {"role": "user", "content": USER_TEMPLATE.format(note_text=note_text[:3000])}
         ],
     )
 
