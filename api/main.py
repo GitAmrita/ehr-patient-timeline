@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from api.db import close_conn
-from api.routers import patients
+from api.routers import patients, timeline
 
 
 @asynccontextmanager
@@ -18,3 +18,4 @@ app = FastAPI(
 )
 
 app.include_router(patients.router)
+app.include_router(timeline.router)

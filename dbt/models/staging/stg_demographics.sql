@@ -33,13 +33,13 @@ SELECT
     MAX(patient_id)                                                  AS patient_id,
     MAX(patient_name)                                                AS patient_name,
     COALESCE(
-        MAX(CASE WHEN NOT age_inferred    THEN age    END),
+        MAX(CASE WHEN NOT age_inferred THEN age END),
         MAX(age)
-    )                                                                AS age,
+    ) AS age,
     COALESCE(
         MAX(CASE WHEN NOT gender_inferred THEN gender END),
         MAX(gender)
-    )                                                                AS gender,
+    ) AS gender,
     MAX(dob)                                                         AS dob
 FROM normalised
 GROUP BY folder_id
