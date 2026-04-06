@@ -13,7 +13,7 @@ Design decisions:
 
 Output schema (one row per entity per note):
     folder_id, patient_id, note_date, note_type,
-    entity_type, entity_value, confidence
+    entity_type, entity_value, is_inferred, source_text
 
 Usage:
     python pipeline/nlp_enrichment.py
@@ -57,27 +57,67 @@ EXTRACTION_TOOL = {
         "properties": {
             "diagnoses": {
                 "type": "array",
-                "items": {"type": "string"},
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "value":       {"type": "string", "description": "The extracted entity (e.g. 'Type 2 Diabetes')"},
+                        "is_inferred": {"type": "boolean", "description": "True if implied by context, false if explicitly stated"},
+                        "source_text": {"type": ["string", "null"], "description": "Exact sentence or phrase from the note supporting this entity. Null if not found."},
+                    },
+                    "required": ["value", "is_inferred", "source_text"],
+                },
                 "description": "Medical conditions and diagnoses mentioned (e.g. 'Type 2 Diabetes', 'Heart Failure')",
             },
             "medications": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Medications with dosages if present (e.g. 'Furosemide 40mg daily')",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "value":       {"type": "string", "description": "Medication with dosage if present (e.g. 'Furosemide 40mg daily')"},
+                        "is_inferred": {"type": "boolean"},
+                        "source_text": {"type": ["string", "null"]},
+                    },
+                    "required": ["value", "is_inferred", "source_text"],
+                },
+                "description": "Medications with dosages if present",
             },
             "procedures": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Tests, procedures, and imaging performed (e.g. 'Echocardiogram', 'Chest X-ray')",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "value":       {"type": "string", "description": "Test, procedure, or imaging (e.g. 'Echocardiogram')"},
+                        "is_inferred": {"type": "boolean"},
+                        "source_text": {"type": ["string", "null"]},
+                    },
+                    "required": ["value", "is_inferred", "source_text"],
+                },
+                "description": "Tests, procedures, and imaging performed",
             },
             "key_findings": {
                 "type": "array",
-                "items": {"type": "string"},
-                "description": "Notable clinical findings and results (e.g. 'EF 35%', 'bilateral pleural effusion')",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "value":       {"type": "string", "description": "Notable finding or result (e.g. 'EF 35%')"},
+                        "is_inferred": {"type": "boolean"},
+                        "source_text": {"type": ["string", "null"]},
+                    },
+                    "required": ["value", "is_inferred", "source_text"],
+                },
+                "description": "Notable clinical findings and results",
             },
             "follow_up": {
                 "type": "array",
-                "items": {"type": "string"},
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "value":       {"type": "string", "description": "Recommended next step or referral"},
+                        "is_inferred": {"type": "boolean"},
+                        "source_text": {"type": ["string", "null"]},
+                    },
+                    "required": ["value", "is_inferred", "source_text"],
+                },
                 "description": "Recommended follow-up actions and next steps",
             },
         },
@@ -87,8 +127,11 @@ EXTRACTION_TOOL = {
 
 SYSTEM_PROMPT = """You are a clinical NLP system. Extract structured medical entities from the following clinical document.
 
-Be precise and concise. Only extract entities explicitly mentioned in the text.
-Do not infer or add information not present in the document."""
+Rules:
+- Only extract entities that appear in the text. Do not add clinical judgement or outside knowledge.
+- For each entity, copy the exact sentence or phrase from the document that supports it into source_text.
+- If you cannot find supporting text in the document, set source_text to null — do not fabricate a citation.
+- Set is_inferred to true only if the entity is implied by context (e.g. inferred from a medication or lab value) rather than explicitly named."""
 
 USER_TEMPLATE = """<document>
 {note_text}
@@ -148,9 +191,18 @@ def flatten_entities(row: pd.Series, entities: dict) -> list[dict]:
     }
     rows = []
     for entity_type, values in entities.items():
-        for value in values:
-            if value and value.strip():
-                rows.append({**base, "entity_type": entity_type, "entity_value": value.strip()})
+        for item in values:
+            # Each item is now an object: {value, is_inferred, source_text}
+            value = item.get("value", "").strip() if isinstance(item, dict) else str(item).strip()
+            if not value:
+                continue
+            rows.append({
+                **base,
+                "entity_type":  entity_type,
+                "entity_value": value,
+                "is_inferred":  item.get("is_inferred", False) if isinstance(item, dict) else False,
+                "source_text":  item.get("source_text") if isinstance(item, dict) else None,
+            })
     return rows
 
 
