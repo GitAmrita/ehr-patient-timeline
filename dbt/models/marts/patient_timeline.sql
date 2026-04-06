@@ -47,7 +47,7 @@ notes AS (
         note_date                                   AS event_date,
         'note'                                      AS event_type,
         note_type                                   AS event_subtype,
-        LEFT(note_text, 300)                        AS description,
+        note_summary                                AS description,
         NULL                                        AS provider,
         NULL                                        AS outcome
     FROM {{ ref('stg_notes') }}
