@@ -35,11 +35,12 @@ models:
         tests:
           - accepted_values:
               arguments:
-                values: ['HIGH', 'LOW', 'NORMAL', 'CRITICAL', 'CRITICAL HIGH', 'CRITICAL LOW',
-                         'ABNORMAL', 'PENDING', 'NEGATIVE', 'POSITIVE', 'BORDERLINE',
-                         'BORDERLINE HIGH', 'PRELIMINARY', 'OPTIMAL', 'LOW NORMAL',
-                         'LOW RISK', 'AVERAGE RISK', 'DESIRABLE', 'TARGET MET',
-                         'HIGH/OPTIMAL', 'ROOM AIR', 'NO GROWTH TO DATE', '-', '--']
+                values: [
+                  'HIGH', 'LOW', 'CRITICAL', 'CRITICAL HIGH', 'CRITICAL LOW',
+                  'ABNORMAL', 'POSITIVE', 'BORDERLINE', 'BORDERLINE HIGH',
+                  'NORMAL', 'NEGATIVE', 'OPTIMAL', 'LOW NORMAL', 'LOW RISK',
+                  'AVERAGE RISK', 'DESIRABLE', 'TARGET MET', 'HIGH/OPTIMAL'
+                ]
 
   - name: stg_notes
     description: One row per clinical note document
